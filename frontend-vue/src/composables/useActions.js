@@ -4,13 +4,17 @@ export function useActions(state) {
   const {
     text, report, polished, changes, safetyFailures, papers, translateResult,
     pipelineSteps, loading, errorMsg, shareBanner, shareCode, intensity, userName, showToast,
+    searchLimit, savedPapers, history,
   } = state;
 
   async function doDetect() {
     loading.value = 'detect'; errorMsg.value = ''; report.value = null; polished.value = ''; changes.value = []; safetyFailures.value = [];
     try {
       const r = await api('/api/detect', { method: 'POST', body: JSON.stringify({ text: text.value }) });
-      if (r.success) report.value = r.data;
+      if (r.success) {
+        report.value = r.data;
+        pushHistory({ type: 'detect', text: text.value, polished: '', at: Date.now() });
+      }
       else errorMsg.value = r.detail || '检测失败';
     } catch (e) { errorMsg.value = '后端未响应，请确认 python backend/server.py 已启动'; }
     loading.value = '';
@@ -26,6 +30,7 @@ export function useActions(state) {
         polished.value = r.data.polished;
         changes.value = r.data.changes;
         safetyFailures.value = r.data.safety_failures || [];
+        pushHistory({ type: 'polish', text: text.value, polished: r.data.polished, at: Date.now() });
       } else errorMsg.value = r.detail || '润色失败';
     } catch (e) { errorMsg.value = '后端未响应，请确认 python backend/server.py 已启动'; }
     loading.value = '';
@@ -60,7 +65,7 @@ export function useActions(state) {
   async function doSearchOnly() {
     loading.value = 'search'; errorMsg.value = '';
     try {
-      const r = await api('/api/search', { method: 'POST', body: JSON.stringify({ text: text.value, limit: 5 }) });
+      const r = await api('/api/search', { method: 'POST', body: JSON.stringify({ text: text.value, limit: searchLimit.value }) });
       if (r.success) papers.value = r.data.results || [];
       else errorMsg.value = r.detail || '检索失败';
     } catch (e) { errorMsg.value = '检索服务不可用'; }
@@ -105,6 +110,65 @@ export function useActions(state) {
 
   function quickPolish() { doPolish() }
 
+  // ── 收藏文献 ──
+  function toggleSavePaper(paper) {
+    if (!paper) return;
+    const id = paper.paper_id || paper.url || paper.title;
+    const idx = savedPapers.value.findIndex(p => (p.paper_id || p.url || p.title) === id);
+    if (idx >= 0) {
+      savedPapers.value.splice(idx, 1);
+      showToast('已取消收藏');
+    } else {
+      // 存轻量字段，避免摘要撑爆 localStorage
+      savedPapers.value.unshift({
+        paper_id: paper.paper_id,
+        title: paper.title,
+        authors: paper.authors || [],
+        year: paper.year,
+        venue: paper.venue,
+        citations: paper.citations,
+        url: paper.url,
+        open_access_pdf: paper.open_access_pdf,
+        saved_at: Date.now(),
+      });
+      showToast('已收藏');
+    }
+  }
+  function isPaperSaved(paper) {
+    if (!paper) return false;
+    const id = paper.paper_id || paper.url || paper.title;
+    return savedPapers.value.some(p => (p.paper_id || p.url || p.title) === id);
+  }
+  function removeSavedPaper(id) {
+    const idx = savedPapers.value.findIndex(p => (p.paper_id || p.url || p.title) === id);
+    if (idx >= 0) savedPapers.value.splice(idx, 1);
+  }
+
+  // ── 历史记录 ──
+  // 自增序号：保证同一毫秒内写入多条时 id 仍唯一（Date.now() 同毫秒会撞 key）
+  let historySeq = 0;
+  function pushHistory(entry) {
+    historySeq += 1;
+    entry.id = entry.at + '-' + historySeq;
+    history.value.unshift(entry);
+    if (history.value.length > 30) history.value.length = 30; // 最多保留 30 条，防撑爆
+  }
+  function removeHistory(idx) {
+    history.value.splice(idx, 1);
+  }
+  function clearHistory() {
+    history.value = [];
+  }
+  function loadHistory(entry) {
+    if (!entry) return;
+    text.value = entry.text || '';
+    polished.value = entry.polished || '';
+    report.value = null;
+    changes.value = [];
+    safetyFailures.value = [];
+    showToast('已载入历史记录');
+  }
+
   function quickUndo() {
     if (polished.value && confirm('恢复原文并清除检测结果？')) {
       polished.value = ''; changes.value = []; report.value = null; safetyFailures.value = [];
@@ -132,5 +196,7 @@ export function useActions(state) {
   return {
     doDetect, doPolish, doPipeline, doTranslateOnly, doSearchOnly, doShare,
     fetchShare, quickPolish, quickUndo, handleDrop, handleFileSelect,
+    toggleSavePaper, isPaperSaved, removeSavedPaper,
+    pushHistory, removeHistory, clearHistory, loadHistory,
   };
 }

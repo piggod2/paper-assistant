@@ -1,0 +1,354 @@
+论文智助 — 压测发现的恶性 Bug 记录（2026-11-25）
+=====================================================
+
+测试环境：Windows / Python venv / uvicorn 127.0.0.1:8000
+记录范围：两轮测试（第一轮 52 项压测 + 第二轮 44 项离线 / 22 项付费）
+问题总数：14 个（P0×2 / P1×3 / P2×7〔含 2 项演示风险〕/ P3×2）
+当前状态：已修复 7 个（BUG-1、BUG-2、BUG-9、BUG-11~14）／待修 7 个（P1×1 / P2×2 / P3×2，另 2 项演示风险）
+
+【BUG-1】A1 变体正则 O(n^2) 灾难性回溯（P0，会让演示翻车）— 已修复
+  位置：data/polish-rules.json（A1 变体「不重要重要的是」）+ backend/detector.py 变体循环
+  修复前正则：([^，。；！？]+)不重要[，,]\s*(?:重要的是|真正重要的是|关键是)\s*([^，。；！？]+)
+  原因：开头就是无限定长度的否定字符类，且前面没有任何锚点。
+        文本里没有「不重要，」时，每个起点都要扫到结尾再回退，整体 O(n^2)。
+        因为 [^，。；！？] 也放行英文字母，所以英文长文本同样中招。
+  修复前实测（无中文标点的文本）：
+      10,000 字 -> 0.41s
+      20,000 字 -> 1.64s   （约 4 倍）
+      40,000 字 -> 6.57s   （约 4 倍）
+      60,000 字 -> 17.50s  （HTTP 请求已超时）
+     300,000 字 -> >90s 超时
+  英文实测（修复前）：20,000 字符 1.48s / 40,000 字符 5.95s
+  影响：/api/detect、/api/polish、/api/pipeline、/api/agent/chat 全部受影响
+  修法（两条，均不改变命中语义）：
+        ① 字符类加上限并排除换行：{1,60} + [^，。；！？\n]
+           —— 每个起点最多回溯 60 步，复杂度由 O(n^2) 降为 O(60n)；
+           未加 (?<=…) 左锚点，因为「我认为价格不重要」这类前文无标点的句子
+           加了锚点会漏检（宁可保召回，用上限换性能）。
+        ② 变体新增可选 "prefilter" 字段，detector 先做关键词预筛：
+           "不重要" 不在文本里就整条跳过，杜绝无谓全量扫描。
+  修复后实测（无标点长文本）：
+      10,000 字 -> 0.023s   20,000 字 -> 0.030s   40,000 字 -> 0.059s
+      60,000 字 -> 0.093s   300,000 字 -> 0.457s（修复前 >90s 超时，约 200 倍）
+  修复后实测（英文 20,000/40,000 字符）：0.014s / 0.029s
+  修复后最坏情况（含「不重要」但无「重要的是」）：
+      20,000 字 0.049s / 40,000 字 0.082s / 60,000 字 0.122s / 100,000 字 0.203s
+      —— 线性增长，无二次爆炸
+  召回回归（4 条全部仍命中，改写结果不变）：
+      价格不重要，关键是性能。                     → 命中 1 条 → 润色「性能。」
+      这个方案的设计细节不重要，真正重要的是落地效果。 → 命中 1 条 → 「落地效果。」
+      我认为价格不重要，重要的是能不能用。           → 命中 1 条 → 「能不能用。」
+      A 不重要，重要的是 B。                        → 命中 1 条 → 「B。」
+  误报回归：这个问题很重要，关键是方法要对。 → 0 条（未因改动新增误报）
+
+【BUG-2】detect / polish 同步阻塞事件循环（P0）— 已修复
+  位置：backend/server.py api_detect、api_polish
+  原因：detector.detect / rewriter.rewrite 是 CPU 密集同步调用，直接跑在 async 函数里。
+        对照 api_pipeline 已经用了 asyncio.to_thread，但 detect/polish 漏了。
+  修复前实测：发一个 60,000 字请求（耗时 17.5s），同时请求 /api/health
+        -> 健康检查延迟 16.50s（整个服务被单请求拖死）
+  影响：任何慢请求都会让全站接口一起卡住，包括健康检查
+  修法：① api_detect 改 await asyncio.to_thread(detector.detect, req.text)；
+        ② api_polish 把「检测→润色（英文先翻译）」整段抽成同步函数 _polish_sync，
+           接口层 await asyncio.to_thread(_polish_sync, req.text, req.options)。
+           注意：英文分支里的 translator.translate 也是同步 HTTP 调用，
+           一并放进线程里，否则英文润色仍会阻塞事件循环。
+  修复后实测：20 万无标点字 detect 耗时 0.45s，同期 /api/health 延迟
+        188 / 158 / 24 / 2 / 2 ms，最大 188ms（修复前 16.5s）→ PASS
+  响应结构回归：/api/polish 返回字段与修复前完全一致
+        changes / original / polished / report / safety_failures /
+        total_changes / translated_from；report 子字段 summary/hits/metrics/f_metrics
+  英文分支回归（打桩 translator，零外网零额度）：translated_from='en'、
+        translate 调用 1 次、润色生效；中文分支 translate 调用 0 次；options 透传正常
+
+【BUG-3】分享存储无上限、无过期（P2）
+  位置：backend/server.py 第 130 行 _share_store: dict[str, dict] = {}
+  原因：裸 dict，没有容量上限，没有 TTL 清理
+  实测：连续创建 200 条分享，200 条全部保留（短码无碰撞，但内存只增不减）
+  影响：长时间运行内存持续增长；重启后全丢（已知限制已写进 README）
+  修法：加 MAX_SHARE 上限 + FIFO/LRU 淘汰，或落盘成 json
+
+【BUG-4】请求体无长度限制（P1）
+  位置：backend/server.py 第 80-81 行 class TextRequest（只有 text: str，无 max_length）
+  实测：300,000 字符直接接收，然后触发 BUG-1 卡死
+  影响：放大 BUG-1 / BUG-2 的破坏力，也缺一层防滥用保护
+  修法：Field(..., max_length=50000)，超限返回 413 或 422
+
+【已确认无问题】（52 项测试中 48 项通过）
+  health / rules / detect 空输入 / polish 空输入 / X 级隔离 / options 变体
+  judge / translate 双向 + 超长分段 / search 双源降级 + limit 边界 + 非法 source
+  pipeline 全开/全关/中文 / share 存取往返 + 404 / agent 5 种 mode + history
+  qa SSE 流式 / 静态首页 / legacy 封禁 / 未知路由 404 / 并发 polish x16 / 并发 share x16
+  非法 JSON 422 / text 类型错误 422 / HTML 标签原样保留
+
+【测试脚本注意事项】
+  之前有测试直接卡死，原因是把 200,000 字无标点文本喂给了 /api/detect。
+  重测时对重负载用例必须：
+    1) 请求前先探 /api/health，延迟 > 3s 就跳过
+    2) 单请求 timeout 不超过 15s，超时按「已知 Bug 触发」记，不当崩溃处理
+    3) 长度上限压到 40,000 字以内（或改为进程内直调，不经过 HTTP）
+
+
+=====================================================
+第二轮测试（2026-11-25 追加）
+=====================================================
+
+【额度消耗记录】（用户授权上限 10 万字符，实际只用 6,708）
+  百度翻译实际消耗：6,708 字符 / 6 次调用
+      其中 6,200 字符（92.4%）来自 A5「超长分段」用例（6200 字 → 2 段）
+      其余 5 项合计仅 508 字符
+  占比：授权额度 6.71% / 剩余 93 万额度 0.72%
+  余额估算：93 万 → 约 92.33 万
+  DeepSeek：约 19 次短调用（判读 5、检索提词 4、问答 3、pipeline 检索 2、探针 7）
+  说明：DeepSeek 按 token 计费，与百度字符额度互不影响
+
+【第二轮测试覆盖】
+  离线零消耗测试 44 项（tmp_test_light.py）：PASS 44 / FAIL 0 / ERROR 0
+  付费功能测试   22 项（tmp_test_paid.py，带 2 万字符硬预算护栏）：
+                              PASS 22 / FAIL 0 / ERROR 0
+  测后探活：/api/health 200，无残留卡顿（上一轮卡死状态已自行恢复）
+
+【BUG-5】英文润色结果「改动 0 处」，演示易被误判为失效（P2 演示风险）
+  位置：backend/server.py 第 196-206 行 api_polish 英文分支
+  现象：输入英文 → 自动翻译成中文 → 检测 → 润色
+        返回 translated_from=en、total_changes=0、polished 为中文
+  原因：翻译出的中文本身没有 AI 味信号，改写引擎自然无从下手（逻辑无错）
+  影响：现场演示时「英文进、中文出、零改动」，评委易误以为功能坏了
+  修法建议：不改代码；答辩时英文只演示「翻译」，润色改用中文原文演示
+
+【BUG-6】A2 召回缺口：「提示语 + 修饰词」两层都漏（P2 质量缺口）
+  位置：data/polish-rules.json 第 107 行 A2 pattern（只认「结论：」）
+        backend/qa.py _SEMANTIC_TASKS.conclusion_colon（把「结论很明确：」判为提示语豁免）
+  实测样本：'结论很明确：这套方法在真实场景下并不可靠。'
+        detect hits={} actionable=0，语义判读 verdict=否，两层都不报
+  对比（正常应报）：'一句话总结：…' → A2 命中并正确删除
+                    '核心是：…'   → A2 命中并正确删除
+  影响：缺口很窄，仅「结论/核心 + 修饰词 + 冒号」这一小类；不影响主流程
+  修法建议：A2 pattern 中「结论|核心|关键」后可放行修饰词，如 结论(?:很|较为|已经|十分)?明确?
+
+【BUG-7】pipeline 全流程耗时约 8 秒，演示需提前打招呼（P2 演示风险）
+  实测：C1 pipeline 中文全流程 8,059ms
+        （翻译约 1s + 检索约 6s + 润色 <0.1s，检索走外网为主耗时）
+  影响：现场网络更差时可能 10s+，评委易以为页面卡死
+  修法建议：不改代码；演示时口头提示「检索需要等几秒」，或改用离线保底路线
+
+【BUG-8】英文检索关键词把短语拆散（P3 精度）
+  位置：backend/searcher.py _extract_keywords / _extract_en_keywords
+  实测：输入 'attention mechanism transformer'
+        输出关键词 ['transformer', 'attention', 'mechanism']（拆成单词而非短语）
+  影响：仍能出结果（3 篇正常），但检索精确度略降
+  修法建议：英文路径优先做 n-gram（2~3 词）短语抽取，单词作为补充
+
+【本轮确认无问题】
+  离线 44 项：health / rules 完整性（27 条 6 级 ID 无重复）/ detect 空文本·纯空白·emoji
+    ·CRLF·未闭合引号·纯标点·零宽字符·幂等性 / polish 空·中文·X级隔离·长度完整
+    ·options 5 变体·二次润色·HTML 保留 / share 往返·404·空·16并发无碰撞
+    ·agent 空消息·chat模式·auto闲聊·检测意图·强制detect·强制polish·非法mode
+    ·解释意图·贴文本 / pipeline 纯本地·全关 / 静态首页·legacy封禁·未知404·静态资源
+    ·参数校验 4 项 / 并发 polish 16
+  付费 22 项：translate 中英双向·空·纯空白·超长分段·分段逻辑本地验证
+    ·英文润色触发翻译 / pipeline 中英全流程 / judge 结论冒号·同构三连·空·非法task
+    ·task缺省 / search 英文·词表命中·自由中文·limit越界·非法source
+    ·qa SSE流式·带称呼·非法模型
+
+【本轮新增观察】（非 Bug，答辩可用）
+  ① 27 条规则中有 10 条 pattern 为 null（B6 B7 B8 C1 C2 C3 C4 X5 X7 X8），
+     靠代码逻辑/结构指标/人工审读实现，不是纯正则 —— 评委问「是不是一堆正则」时的答点
+  ② 代码块隔离生效：```python 围栏内的 AI 味词命中数为 0，不会误改用户代码
+  ③ 离线保底路线：POST /api/pipeline {run_translate:false, run_search:false, run_polish:true}
+     → steps 为 translate=skipped / search=skipped / polish=ok
+     完全零外网可跑「检测+润色」，现场断网时的救命方案
+  ④ 语义判读与 A2 正则分工明确，判读在「结论在前、论证在后」样本上
+     正确判「是」并给出拆句建议（'该方法是有效的：在三个数据集上…'）
+     豁免样本（人物原话 / 总说分说 / 三个要点）也全部正确判「否」
+
+【BUG-9】历史记录持久化遇 localStorage 配额会中断（P2，已修复 2026-11-25）
+  位置：frontend-vue/src/composables/useSettings.js（history / savedPapers 两个 watch）
+  原因：setItem 没有 try/catch；history 条目存的是全文（text + polished），
+        没有截断。单条 5 万字（原文+改文）实测占 293 KB，30 条约 8.6 MB，
+        而浏览器 localStorage 上限约 5 MB。
+  修复前实测（Node + 真实 Vue 3.5.46，40 万字符/条）：
+        第 5 条写入时抛 QuotaExceededError，内存 5 条 / 磁盘只剩 4 条；
+        Vue 打印 [Vue warn] Unhandled error during execution of watcher callback
+        + Unhandled error during execution of scheduler flush
+        之后所有历史写入全部失败，刷新后停在溢出前那几条
+  已做修复：
+        ① savedPapers 持久化包 try/catch（收藏本身是轻量字段，只做兜底）
+        ② history 持久化改为「超限则折半裁剪最旧条目后重试」，
+           直到写入成功或只剩 1 条（1 条仍存不下则放弃持久化、内存保留）
+        ③ 发生裁剪时同步更新内存 history 并 toast「存储空间不足，已自动清理旧历史」，
+           用 persistingHistory 标志位防 watch 递归
+        ④ 内存与磁盘保持一致，不再出现「界面有 N 条、刷新只剩 N-1 条」
+  修复后实测（同一压力场景，连写 8 条 40 万字）：
+        自动裁到 2 条（约 4.8 MB），内存/磁盘一致，无 Unhandled 警告，
+        toast 正常提示；其余 16 项回归全 PASS
+  仍未处理（低优先）：条目本身不截断，单条超长文本仍会吃掉大量配额，
+        建议后续把 history 只存前 2000 字预览 + 原文另存 IndexedDB
+
+【BUG-10】历史记录列表 :key 用毫秒时间戳，同毫秒会撞 key（P3）
+  位置：frontend-vue/src/components/RightPanel.vue 第 70 行
+        <div class="history-item" v-for="(h, i) in history.value" :key="h.at">
+  原因：at 是 Date.now()，两条记录落在同一毫秒即重复 key；
+        展开态 expandedHistory 也是按 h.at 判定，会一起展开
+  实测：pushHistory 连写两条（at 相同）→ keys 完全相同
+  影响：真实交互几乎不可能同毫秒（检测/润色都要几百毫秒以上），
+        极端情况下 Vue 报 duplicate key 警告 + 展开态串台
+  修法：pushHistory 里用 at + 自增序号，或 :key="h.at + '-' + i"
+
+【前端功能验证（收藏文献 / 历史记录）17 项全 PASS】
+  环境：Node + 真实 Vue 3.5.46 + localStorage 桩（含 5MB 配额模拟），
+        真实调用 useActions / useSettings，零外网、零翻译额度消耗
+  收藏文献：添加（★ 变 ☆，toast「已收藏」）/ 取消（toast「已取消收藏」）
+    / paper_id 缺失时 url 兜底匹配 / 只有 title 时 title 兜底
+    / 空值与不存在 id 不崩 / 刷新后恢复（最新在前，authors 保留）
+    / 只存轻量字段（abstract、tldr 不入库，单条约 186 字节）
+    / localStorage 被写坏成非法 JSON 时静默回退空数组
+  历史记录：检测后自动写入（type=detect）/ 润色后自动写入（type=polish，带改文）
+    / 最新在前 / 上限 30 条（写 40 条截断到 30）/ 单条删除 / 清空（内存+磁盘同步）
+    / 载入到主区（原文·改文进输入区，report/changes/safetyFailures 一并清空）
+    / 刷新后恢复
+  线上包同步：frontend/assets/index-*.js 内含「已收藏/已取消收藏/已载入历史记录」
+    + paper_assistant_history / paper_assistant_savedPapers 共 5 处命中，
+    说明当前 dist 与 src 一致（不是旧包）
+  组件接线：App.vue → SearchPanel（:toggle-save-paper / :is-paper-saved，
+    ☆ 按钮）；App.vue → RightPanel（savedPapers / history / removeSavedPaper，
+    ✕ 删除、清空、载入到主区按钮齐全）
+
+【BUG-11】A1 补系词的动词白名单误判名词，产出病句（P1）— 已修复
+  位置：backend/rewriter.py A1 主模式（pred 前缀判定）
+  原因：白名单把「生成/产生/形成/构成/建立」等一律当动词，认为「主语+动词」已完整、
+        不再补「是」。但「生成内容」「产生的影响」「形成的原因」里这些词是名词定语。
+  修复前：
+        「当前工具的核心痛点并不是检索能力不足，而是生成内容里那种挥之不去的模板感」
+        → 「当前工具的核心痛点生成内容里那种挥之不去的模板感」（缺「是」，句子崩了）
+  修复后：
+        → 「当前工具的核心痛点是生成内容里那种挥之不去的模板感。」✓
+  修法：白名单拆成两级——
+        ① _VERB_ASPECT：任何动词后接体标记「了/着/过」才确定为谓语（提供了/提升了）；
+        ② _PREDICATIVE_HEAD：情态/轻动词（需要/面临/具有/涉及/存在/包括…）可直接作谓语，
+           但若 pred 里带「的」且不是情态动词开头（如「涉及多个部门的方案」），
+           说明是名词短语，仍补「是」。
+        ③ 其余一律补「是」，宁可多补也不漏。
+  回归：问题并不是缺少数据，而是分析方法的缺失 → 问题是分析方法的缺失 ✓
+        缺陷并不是速度慢，而是结果不可解释 → 缺陷是结果不可解释 ✓
+        系统并不是不能运行，而是需要更多配置 → 只报告不改（A 段能力否定，见 BUG-12）
+
+【BUG-12】A1 在「不是A，而是B」上直接删 A，会反转语义（P1）— 已修复
+  位置：backend/rewriter.py A1 主模式
+  原因：规则注释已警告「禁止只删 A，而是」，但代码实现就是只留 B。
+        A 承载对比信息时（不是改不出来，而是改出来一句坏话），删 A 后意思整个反掉。
+  修复前：
+        「我们需要找到一种平衡——不是改不出来，而是改出来一句坏话；不是删掉修饰成分…」
+        → 「我们需要找到一种平衡，改出来一句坏话；不是删掉修饰成分…」
+        （原意：能改，但改出来是坏话 → 现意：找到平衡，去改出一句坏话）
+        「…「不对劲」，并不是某一个特征在作祟，而是一组特征的叠加：句子太完整…」
+        → 「…「不对劲」，是一组特征的叠加全。」（缺「因为」，且冒号后的列表被整段吞掉）
+  修复后：
+        「我们需要找到一种平衡，不是改不出来，而是改出来一句坏话。不是删掉修饰成分，
+          而是拆成两个分句，…」✓（原样保留对比，不再反转）
+        「…「不对劲」，是因为一组特征的叠加：句子太完整、段落太整齐、转折太顺滑、
+          结论太安全。」✓
+  修法：① _A_CAPABILITY_NEG（不出来/不了/不到/不能/不会/无法/难以/没法/不可能/不行）
+           与 _A_ACTION_HEAD（删掉/删除/去掉/砍掉/放弃/减少/降低/避免/省略/回避）
+           命中时放弃改写，只报告；
+        ② 「之所以…，并不是A，而是B」→「之所以…，是因为B」（缺「因为」不通）；
+        ③ A1 主正则的 A/B 段与 detector 规则同步排除「；：」，避免一个命中跨分句吞掉
+           冒号后的列举；改写只替换子匹配区间，命中段两端残留原样保留。
+
+【BUG-13】B3 删前置话题壳时连段落空行一起删，两段被合并（P2）— 已修复
+  位置：backend/rewriter.py B3 分支
+  原因：B3 的 pattern 含 (?:^|[。！？])\s*，\s* 会吞掉「。\n\n」里的两个换行；
+        返回 boundary（"。"）时把换行一起丢掉。B5 有专门的 "\n" in match 分支，B3 没有。
+  修复前：原文 6 段 → 润色后 5 段，段 4 从 300 字涨到 508 字
+  修复后：段落数 6 → 6 ✓，「对于实际应用场景而言，」删掉后空行完整保留
+  修法：B3 补 "\n" in match 分支，只 re.sub 掉话题壳本身，保留全部标点与换行。
+
+【BUG-14】B1「连续de」误报主谓句 + 命中区间从词中间开始（P2）— 已修复
+  位置：backend/detector.py _detect_b1_de_density + 新增 _expand_left
+        正则 [一-鿿]{2,12}的[一-鿿]{2,12}的[一-鿿]{2,12}
+  原因：只看「的…的」间距，不看结构。正常主谓句里两个「的」挨得近就命中。
+  修复前（6 条 B1 命中里 2 条误报）：
+        误报①「这类小标题的频率是人类的三倍有余」
+        误报②「我们需要关注的另一个维度是连接词的使用模式」
+        高亮错位：「识别并消除…」被切成「别并消除…」，从半个词开始
+  修复后（B1 由 6 条降到 4 条，2 条误报消失）：
+        误报①第二段「频率是人类」含判断词「是」→ 判定为小句，豁免 ✓
+        误报②第二段「另一个维度是连接词」含「是」→ 豁免 ✓
+        高亮「能够有效识别并消除机器生成文本特征的新型辅助系统的设计与实现路径时」
+        → 起点左扩到「能」，词边界完整 ✓
+  修法：① _COPULA_AFTER_DE：第三段以「是/为/就是/在于/则/即」开头 → 主谓句，豁免；
+        ② _PRED_IN_MID：第二段含判断词/否定词 → 中间是小句，豁免；
+        ③ _expand_left：命中起点向左吞汉字最多 6 字、遇标点即停，修词边界错位。
+
+【真实长文输入验证（1446 字 / 6 段，BUG-1/2/11~14 全部修复后复测）】
+  环境：进程内直调 detector.detect + rewriter.rewrite，另用 HTTP 打 /api/polish 交叉验证
+  结果：detect + rewrite 合计 0.012s，HTTP 端到端 101ms，success=true，
+        命中 52 处（A1×5 A2×1 A3×3 B3×2 B4×3 B5×6 B1×4 B2×13 B6×1 F1×2 F2×6 X2×3 X6×3），
+        改动 25 处，安全回退 0 处，translated_from 为空，段落数 6→6
+  说明：A1 由 4 条变 5 条不是新增误报，而是 BUG-12 修复后 A/B 段排除「；」，
+        原本被吞成一条的「不是改不出来，而是改出来一句坏话；不是删掉修饰成分，而是拆成两个分句」
+        正确拆成两条独立命中（两条都按能力否定/动作否定策略原样保留，未改写）。
+  额度：中文输入不触发百度翻译，本次消耗 0 字符
+  回归：tmp_test_light.py 44/44 PASS（BUG-1/2/11~14 修复后无功能回退）
+  结论：4 处硬伤 + 2 处 B1 误报 + 2 个 P0 全部修复，剩余问题见下方优先级汇总
+
+【优先级汇总（第五轮后更新）】
+  P0 必改：无（BUG-1、BUG-2 已修复）
+  P1 该改：BUG-4 请求体无长度上限
+  P2 建议：BUG-3 分享存储无上限、BUG-6 A2 召回缺口
+  P2 演示风险（不改代码，改演示方式）：BUG-5 英文润色零改动、BUG-7 pipeline 8 秒
+  P3 精度：BUG-8 英文短语被拆散、BUG-10 历史 key 同毫秒冲突
+  已修复：BUG-1 A1 变体正则 O(n^2) 回溯（加字符类上限 + 关键词预筛，300k 字 90s→0.46s）
+          BUG-2 detect/polish 同步阻塞事件循环（改 asyncio.to_thread，探活延迟 16.5s→188ms）
+          BUG-9 历史存储溢出中断（降级裁剪 + toast 提示，已重新构建 dist）
+          BUG-11 A1 补系词误判名词（产病句）
+          BUG-12 A1 删 A 反转语义 / 吞掉冒号后列表
+          BUG-13 B3 删话题壳合并段落
+          BUG-14 B1 连续de 误报主谓句 + 高亮词边界错位
+  待修 7 个（P1×1 / P2×2 / P3×2，另 2 项演示风险：BUG-5、BUG-7）
+
+【测试脚本清单】（全部位于 tests/ 目录，修复后可直接重跑验证）
+  说明：脚本已改为按 __file__ / import.meta.url 定位项目根目录，
+        可在任意工作目录下运行，例如 python tests/tmp_test_light.py
+  tests/tmp_test_light.py   离线 44 项，零消耗
+  tests/tmp_perf_test.py    BUG-1 正则性能回归（1 万~30 万字无标点 + 最坏情况 + 召回/误报）
+                       运行：python tests/tmp_perf_test.py（0 计费）
+  tests/tmp_test_nonblock.py BUG-2 事件循环回归（慢请求期间探活延迟 + 响应结构一致性）
+                       运行：先起 uvicorn，再 python tests/tmp_test_nonblock.py
+  tests/tmp_test_polish_sync.py BUG-2 重构后的 _polish_sync 分支回归（打桩 translator，零额度）
+                       运行：python tests/tmp_test_polish_sync.py
+  tests/tmp_test_paid.py    付费 22 项，自带 2 万字符硬预算护栏，超限自动中止
+  （已清理）tmp_quota.py / tmp_judge_probe.py / tmp_detect_probe.py / tmp_diag.py
+            / tmp_perf.py / tmp_test2.py / tmp_test3.py / tmp_test4.py —— 一次性探针，
+            用途已由 tmp_test_light.py / tmp_perf_test.py / tmp_test_nonblock.py 覆盖
+  tests/tmp_test_frontend.mjs 前端 17 项（收藏文献 / 历史记录），真实 Vue + 本地存储桩
+                       运行：node tests/tmp_test_frontend.mjs（需 frontend-vue 已 npm install）
+  tests/tmp_test_input.py   真实长文输入验证（读 检测测试文本.txt，跑 detect + polish）
+                       运行：python tests/tmp_test_input.py（0 计费，不触发翻译）
+  tests/tmp_test_c_level.mjs C 级「只报告」端到端验证（真实后端数据 + 真实组件 SSR 渲染，25 项）
+                       运行：先起 uvicorn，再 node tests/tmp_test_c_level.mjs
+  tests/tmp_test_floatnav.mjs 左侧浮动导航 C 级子项验证（reportLevels 10 组场景 + 标签配色 5 项）
+                       运行：先起 uvicorn，再 node tests/tmp_test_floatnav.mjs
+
+【C 级「只报告」明细卡片】（2026-11-25 新增，非 bug 修复）
+  背景：C 级此前只在顶部 stat-bar 显示一行汇总，看不到每条规则的说明与依据。
+  改动：
+    backend/detector.py      _compute_metrics 的 C_counts 新增 C1~C4 键（真实值），
+                             旧 *_prompt 键保留（同值，向后兼容）
+    useDerived.js            新增 C_META（C1~C4 的策略/通俗说明/研究依据/人类参考）
+                             + cItems（展开态明细数据）；summaryC 改为优先按 C1~C4 渲染，
+                             并跳过与 C1~C4 重复的旧键（避免同一指标显示两次）
+    ReportPanel.vue          新增 C 级 level-group 卡片（样式与 A/B/F/H 一致），
+                             无命中位置故按规则逐项列出实测值；值为 null 标「样本不足」
+    App.vue                  透传 :c-items
+    style.css                新增 .level-group.lv-C 左侧色条
+    FloatNav.vue             左侧浮动目录「检测结果」子分支补 C 级：
+                             LEVEL_ORDER 加 'C'、LEVEL_LABEL 加「只报告」、
+                             reportLevels 额外读 summary.C 是否有非 null/非 0 值
+                             （C 级无 pattern，不在 hits 桶里，不能只看 hits）
+    style.css                新增 .float-nav .sub-dot.lv-C 配色 #a0aec0
+  验证：detect / polish / pipeline 三条路径均返回 C1~C4；SSR 渲染 25 项断言全过；
+        FloatNav reportLevels 10 组场景 + 标签配色 5 项 = 15 项全过；
+        离线 44 项、前端 17 项、polish_sync 回归全过；dist 已重建。
+  已知限制：分享码加载路径（doShare → 载入）只还原 summary，hits 丢失，各等级
+            卡片不显示；但 C 级卡片读 summary.C，分享态下仍能正常显示（既有行为，未改）。

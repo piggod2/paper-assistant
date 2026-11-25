@@ -23,7 +23,7 @@ if exist "server.pid" (
     del /q server.pid >nul 2>&1
 )
 
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr /c:":8000 " ^| findstr "LISTENING"') do (
     echo   Closing port-8000 process ^(PID %%a^)...
     taskkill /f /pid %%a >nul 2>&1
 )
@@ -31,12 +31,12 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING
 echo   Done
 echo.
 
-REM === 2. Find Python (prefer project venv) ===
+REM === 2. Find Python (venv first, then bundled python, then system) ===
 echo [2/3] Finding Python...
 set "PYTHON="
 
-if exist "%~dp0venv\Scripts\python.exe" set "PYTHON=%~dp0venv\Scripts\python.exe"
 if exist "%~dp0python\python.exe" set "PYTHON=%~dp0python\python.exe"
+if exist "%~dp0venv\Scripts\python.exe" set "PYTHON=%~dp0venv\Scripts\python.exe"
 
 if "%PYTHON%"=="" (
     for %%p in (
@@ -52,7 +52,10 @@ if "%PYTHON%"=="" (
 
 if "%PYTHON%"=="" (
     for /f "delims=" %%i in ('where python 2^>nul') do (
-        if "!PYTHON!"=="" set "PYTHON=%%i"
+        if "!PYTHON!"=="" (
+            echo %%i | findstr /i /c:"WindowsApps" >nul
+            if errorlevel 1 set "PYTHON=%%i"
+        )
     )
 )
 

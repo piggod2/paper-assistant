@@ -15,6 +15,9 @@ server.pid
 # 虚拟环境
 venv/
 
+# 规则源仓库（上游第三方库，规则已固化为 data/polish-rules.json，无需提交整个上游仓库）
+AI-Paper-Opt/
+
 # Node / Vite
 frontend-vue/node_modules/
 

@@ -15,18 +15,178 @@ from urllib.parse import quote, urlencode
 import requests
 
 logger = logging.getLogger(__name__)
-
 S2_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 ARXIV_URL = "http://export.arxiv.org/api/query"
 
-STOPWORDS_EN = {"the", "of", "and", "a", "an", "in", "to", "for", "on", "with", "is", "are", "was", "were", "by", "from", "this", "that", "these", "those", "be", "has", "have", "it", "as", "or", "at", "not", "but", "we", "our", "their"}
+STOPWORDS_EN = {
+    "the",
+    "of",
+    "and",
+    "a",
+    "an",
+    "in",
+    "to",
+    "for",
+    "on",
+    "with",
+    "is",
+    "are",
+    "was",
+    "were",
+    "by",
+    "from",
+    "this",
+    "that",
+    "these",
+    "those",
+    "be",
+    "has",
+    "have",
+    "it",
+    "as",
+    "or",
+    "at",
+    "not",
+    "but",
+    "we",
+    "our",
+    "their",
+    # 通用动词/程度词：当检索锚点会引入大量噪声（如 significantly / make）
+    "make",
+    "makes",
+    "made",
+    "change",
+    "changes",
+    "changed",
+    "use",
+    "uses",
+    "used",
+    "using",
+    "show",
+    "shows",
+    "shown",
+    "provide",
+    "provides",
+    "more",
+    "most",
+    "also",
+    "can",
+    "could",
+    "may",
+    "might",
+    "must",
+    "should",
+    "would",
+    "will",
+    "however",
+    "therefore",
+    "thus",
+    "significant",
+    "significantly",
+    "many",
+    "much",
+    "such",
+    "than",
+    "then",
+    "there",
+    "here",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "how",
+    "all",
+    "any",
+    "both",
+    "each",
+    "other",
+    "some",
+    "no",
+    "only",
+    "very",
+    "well",
+    "just",
+    "even",
+    "still",
+    "yet",
+    "moreover",
+    "furthermore",
+    "while",
+    "although",
+    "because",
+    "about",
+    "into",
+}
 STOPWORDS_ZH = {
-    "基于", "本文", "研究", "一个", "一种", "这个", "这种", "方面", "通过", "进行", "使用",
-    "以及", "及其", "提出", "方法", "结果", "分析", "模型", "领域", "主导", "架构", "采用",
-    "机制", "并行", "捕捉", "关系", "克服", "限制", "已经", "成为", "能够", "有效", "实现",
-    "为了", "对于", "同时", "并且", "但是", "因此", "所以", "从而", "以及", "主要", "相关",
-    "问题", "系统", "功能", "设计", "工具", "辅助", "场景", "价值", "提升", "显著", "深度",
-    "论文", "摘要", "关键词", "引言", "结论", "实验", "数据", "处理", "自然", "语言", "语言",
+    "基于",
+    "本文",
+    "研究",
+    "一个",
+    "一种",
+    "这个",
+    "这种",
+    "方面",
+    "通过",
+    "进行",
+    "使用",
+    "以及",
+    "及其",
+    "提出",
+    "方法",
+    "结果",
+    "分析",
+    "模型",
+    "领域",
+    "主导",
+    "架构",
+    "采用",
+    "机制",
+    "并行",
+    "捕捉",
+    "关系",
+    "克服",
+    "限制",
+    "已经",
+    "成为",
+    "能够",
+    "有效",
+    "实现",
+    "为了",
+    "对于",
+    "同时",
+    "并且",
+    "但是",
+    "因此",
+    "所以",
+    "从而",
+    "以及",
+    "主要",
+    "相关",
+    "问题",
+    "系统",
+    "功能",
+    "设计",
+    "工具",
+    "辅助",
+    "场景",
+    "价值",
+    "提升",
+    "显著",
+    "深度",
+    "论文",
+    "摘要",
+    "关键词",
+    "引言",
+    "结论",
+    "实验",
+    "数据",
+    "处理",
+    "自然",
+    "语言",
+    "语言",
 }
 
 # 学术领域高频词，直接保留作为检索锚点（中文→英文映射）
@@ -42,6 +202,19 @@ DOMAIN_TERMS = {
     "神经网络": "neural network",
     "预训练": "pre-training",
     "大语言模型": "large language model",
+    "大型语言模型": "large language model",
+    "学术写作": "academic writing",
+    "论文写作": "academic writing",
+    "机器生成": "machine-generated text",
+    "AI生成": "AI-generated content",
+    "AIGC": "AI-generated content",
+    # 英文短语锚点（英文原文检索时直接命中，比单词更准）
+    "large language model": "large language model",
+    "academic writing": "academic writing",
+    "machine-generated": "machine-generated text",
+    "ai-generated": "AI-generated content",
+    "chatgpt": "ChatGPT",
+    "llm": "large language model",
     "词元": "token",
     "知识图谱": "knowledge graph",
     "强化学习": "reinforcement learning",
@@ -255,7 +428,17 @@ DOMAIN_TERMS = {
     "数据可视化": "data visualization",
 }
 
-X_BLACKLIST = {"赋能", "闭环", "抓手", "打法", "颗粒度", "底层逻辑", "对齐", "拉通", "倒逼"}
+X_BLACKLIST = {
+    "赋能",
+    "闭环",
+    "抓手",
+    "打法",
+    "颗粒度",
+    "底层逻辑",
+    "对齐",
+    "拉通",
+    "倒逼",
+}
 
 # in-memory cache
 _cache: dict[str, tuple[float, dict]] = {}
@@ -332,18 +515,95 @@ def _cache_key(text: str, limit: int) -> str:
     return hashlib.md5(f"{text}|{limit}".encode()).hexdigest()
 
 
+def _llm_extract_keywords(text: str) -> list[str]:
+    """用 DeepSeek 把中文/模糊查询提炼成 3-5 个英文检索词。
+
+    优于硬编码 DOMAIN_TERMS：能覆盖词表外的专业术语、新概念、具体研究对象。
+    无 key / 调用失败时返回空列表，由调用方降级到词表+翻译逻辑。
+    """
+    try:
+        from qa import is_available, chat_once  # 延迟导入，避免循环依赖
+    except Exception:
+        return []
+    if not is_available():
+        return []
+
+    has_zh = bool(re.search(r"[一-鿿]", text))
+    # 纯英文且很短（本就是检索词）时不折腾 LLM，直接走词表/TF-IDF
+    if not has_zh and len(text.strip()) <= 40:
+        return []
+
+    prompt = (
+        "你是学术论文检索助手。请把下面这段查询提炼成 3-5 个最关键的英文检索关键词，"
+        "用于在 arXiv / Semantic Scholar 检索论文。\n"
+        "要求：\n"
+        "1. 只输出关键词，用英文逗号分隔，不要输出任何解释、序号或引号。\n"
+        "2. 关键词用英文，专业术语用学术界通用写法（如 'retrieval-augmented generation'）。\n"
+        "3. 优先保留具体的、可区分的概念，去掉'研究''方法''基于'这类泛词。\n"
+        "4. 3-5 个即可，宁缺毋滥。\n\n"
+        f"查询：{text}"
+    )
+    try:
+        raw = chat_once(
+            [
+                {"role": "system", "content": "你是学术检索关键词提炼器，只输出英文关键词。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+    except Exception:
+        return []
+
+    raw = raw.strip().strip("`\"'，,。")
+    # 按逗号/顿号/换行切分，清洗
+    parts = re.split(r"[，,、\n]+", raw)
+    out = []
+    for p in parts:
+        p = p.strip().strip("1234567890.。)）】】、 ")
+        p = re.sub(r"^(关键词|keywords?)[:：]", "", p, flags=re.I).strip()
+        if not p:
+            continue
+        # 只保留英文（含连字符/空格），过滤中文残留和过短/过长
+        if re.search(r"[一-鿿]", p):
+            continue
+        if len(p) < 3 or len(p) > 60:
+            continue
+        out.append(p)
+    return out[:5]
+
+
 def _extract_keywords(text: str) -> list[str]:
     """Extract English keywords for arXiv/S2 search.
 
-    Priority: ① domain terms (中英对照表) → ② English TF-IDF → ③ Chinese→English translation.
+    Priority: ① LLM 提炼（中文/模糊查询最准）→ ② domain terms (中英对照表)
+    → ③ English TF-IDF → ④ Chinese→English translation.
     """
     keywords: list[str] = []
 
-    # ① 领域词表直接命中（中文输入也先扫一遍，这是最准的锚点）
+    # ① LLM 提炼检索词（优先，最准；无 key 或失败时静默降级到词表逻辑）
+    llm_kws = _llm_extract_keywords(text)
+    if llm_kws:
+        keywords.extend(llm_kws)
+
+    # ② 领域词表直接命中（中文输入也先扫一遍，这是最准的锚点）
+    # 长词优先 + 跨度去重：避免「大语言模型」被通用词「模型」抢先命中，导致关键词退化成 model
     lower_text = text.lower()
-    for zh_term, en_term in DOMAIN_TERMS.items():
-        if zh_term.lower() in lower_text:
-            keywords.append(en_term)
+    matched_spans: list[tuple[int, int]] = []
+    for zh_term, en_term in sorted(DOMAIN_TERMS.items(), key=lambda kv: -len(kv[0])):
+        term_low = zh_term.lower()
+        start = 0
+        while True:
+            idx = lower_text.find(term_low, start)
+            if idx < 0:
+                break
+            span = (idx, idx + len(term_low))
+            if any(s < span[1] and idx < e for s, e in matched_spans):
+                start = idx + 1
+                continue
+            matched_spans.append(span)
+            if en_term not in keywords:
+                keywords.append(en_term)
+            start = span[1]
 
     # ② 英文 TF-IDF（对英文输入有效）
     en_kws = _extract_en_keywords(text)
@@ -386,7 +646,7 @@ def _translate_zh_keywords(text: str) -> list[str]:
             # 滑窗 2-4 字
             for width in (4, 3, 2):
                 for i in range(len(chunk) - width + 1):
-                    candidates.append(chunk[i:i + width])
+                    candidates.append(chunk[i : i + width])
 
     # 过滤停用词和纯函数词
     filtered = []
@@ -410,6 +670,7 @@ def _translate_zh_keywords(text: str) -> list[str]:
     # 尝试用百度翻译英译
     try:
         from translator import translate  # 复用翻译模块
+
         translated = []
         for w in top:
             r = translate(w, "zh", "en")
@@ -423,20 +684,58 @@ def _translate_zh_keywords(text: str) -> list[str]:
         return top[:3]  # 翻译失败就用中文原文兜底
 
 
-
 def _extract_en_keywords(text: str) -> list[str]:
     words = re.findall(r"[a-zA-Z]{3,}", text.lower())
     # remove stopwords + X-level blacklist
-    filtered = [w for w in words if w not in STOPWORDS_EN and w.lower() not in {x.lower() for x in X_BLACKLIST}]
-    # TF
+    filtered = [
+        w
+        for w in words
+        if w not in STOPWORDS_EN and w.lower() not in {x.lower() for x in X_BLACKLIST}
+    ]
+    if not filtered:
+        return []
+
+    # ── n-gram 短语抽取（2~3 词）：优先短语，避免「attention mechanism」被拆成
+    #    两个孤立单词，检索精确度更高。短语优先，单词作补充。 ──
+    phrases: list[str] = []
+    for n in (3, 2):
+        for i in range(len(filtered) - n + 1):
+            gram = " ".join(filtered[i : i + n])
+            if gram not in phrases:
+                phrases.append(gram)
+
+    # TF（单词层面，用于评分）
     tf = {}
     for w in filtered:
         tf[w] = tf.get(w, 0) + 1
     total = max(sum(tf.values()), 1)
-    # prefer longer words (IDF-like)
-    scored = [(w, (c / total) * (1 + math.log(len(w)))) for w, c in tf.items()]
-    scored.sort(key=lambda x: -x[1])
-    return [w for w, _ in scored[:5]]
+
+    # 短语评分：用组成词的平均得分 + 长度加成（短语更具体，权重更高）
+    def _score(token: str) -> float:
+        parts = token.split()
+        avg = sum(
+            ((tf.get(p, 1) / total) * (1 + math.log(len(p)))) for p in parts
+        ) / len(parts)
+        return avg * (1 + math.log(len(token)))
+
+    scored_phrases = [(p, _score(p) * 1.3) for p in phrases]  # 短语加权 1.3
+    scored_phrases.sort(key=lambda x: -x[1])
+
+    # 单词评分（原逻辑）
+    scored_words = [(w, (tf.get(w, 1) / total) * (1 + math.log(len(w)))) for w in tf]
+    scored_words.sort(key=lambda x: -x[1])
+
+    # 合并：短语优先，单词补充，去重保序，最多 5 个
+    result: list[str] = []
+    seen: set[str] = set()
+    for tok, _ in scored_phrases + scored_words:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        result.append(tok)
+        if len(result) >= 5:
+            break
+    return result
 
 
 def _extract_zh_keywords(text: str) -> list[str]:
@@ -457,14 +756,14 @@ def _search_s2(keywords: list[str], limit: int) -> dict | None:
     params = {
         "query": query,
         "limit": limit,
-        "fields": "title,abstract,authors,year,citationCount,url,openAccessPdf,externalIds"
+        "fields": "title,abstract,authors,year,citationCount,url,openAccessPdf,externalIds",
     }
     headers = {"x-api-key": key} if key else {}
     for attempt in range(3):
         try:
             resp = requests.get(S2_URL, params=params, headers=headers, timeout=8)
             if resp.status_code == 429:
-                wait = 2 ** attempt
+                wait = 2**attempt
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
@@ -487,16 +786,31 @@ def _format_s2_paper(paper: dict, max_cite: int, keywords: list[str]) -> dict:
     year = paper.get("year", 0)
     citations = paper.get("citationCount", 0)
     url = paper.get("url", "")
-    pdf = paper.get("openAccessPdf", {}).get("url", "") if paper.get("openAccessPdf") else ""
+    pdf = (
+        paper.get("openAccessPdf", {}).get("url", "")
+        if paper.get("openAccessPdf")
+        else ""
+    )
     venue = paper.get("venue", "")
 
     # scoring
-    kw_coverage = sum(1 for kw in keywords if kw.lower() in (title + abstract).lower()) / max(len(keywords), 1)
+    kw_coverage = sum(
+        1 for kw in keywords if kw.lower() in (title + abstract).lower()
+    ) / max(len(keywords), 1)
     title_hit = sum(1 for kw in keywords if kw.lower() in title.lower())
-    title_score = title_hit / max(len(keywords), 1) if title_hit else 0.1 * sum(1 for kw in keywords if kw.lower() in abstract.lower()) / max(len(keywords), 1)
+    title_score = (
+        title_hit / max(len(keywords), 1)
+        if title_hit
+        else 0.1
+        * sum(1 for kw in keywords if kw.lower() in abstract.lower())
+        / max(len(keywords), 1)
+    )
     cite_score = math.log(1 + citations) / math.log(1 + max_cite) if max_cite > 0 else 0
     year_score = min(max((year - 2015) / 11, 0), 1) if year else 0.5
-    score = round(0.40 * kw_coverage + 0.25 * title_score + 0.20 * cite_score + 0.15 * year_score, 2)
+    score = round(
+        0.40 * kw_coverage + 0.25 * title_score + 0.20 * cite_score + 0.15 * year_score,
+        2,
+    )
 
     # relevance reason
     if title_hit >= 2 and citations > 100:
@@ -521,18 +835,25 @@ def _format_s2_paper(paper: dict, max_cite: int, keywords: list[str]) -> dict:
         "url": url,
         "open_access_pdf": pdf,
         "score": score,
-        "relevance_reason": reason
+        "relevance_reason": reason,
     }
 
 
 def _search_arxiv(keywords: list[str], limit: int) -> dict:
     """Search arXiv API (no auth required). Uses ElementTree for robust XML parsing."""
-    query = " AND ".join(f'all:"{kw}"' for kw in keywords[:3])
+    # 短语锚点：短语本身已足够具体。多个短语用 OR 放宽召回，避免 AND 把条件收得过窄
+    # 导致结果只剩 1-2 篇（尤其中文查询经 LLM 提炼出多个精准短语时）。
+    phrase_kws = [k for k in keywords if " " in k][:3]
+    if phrase_kws:
+        query = " OR ".join(f'all:"{kw}"' for kw in phrase_kws)
+    else:
+        # 单词级：用 OR 放宽，前 4 个词参与检索
+        query = " OR ".join(f'all:"{kw}"' for kw in keywords[:4])
     params = {
         "search_query": query,
         "max_results": limit,
         "sortBy": "relevance",
-        "sortOrder": "descending"
+        "sortOrder": "descending",
     }
     url = f"{ARXIV_URL}?{urlencode(params)}"
     resp = requests.get(url, timeout=10)
@@ -563,31 +884,41 @@ def _search_arxiv(keywords: list[str], limit: int) -> dict:
             pdf = link.replace("/abs/", "/pdf/") + ".pdf" if "/abs/" in link else ""
 
             score = round(
-                0.7 * (sum(1 for kw in keywords if kw.lower() in (title + summary).lower()) / max(len(keywords), 1))
+                0.7
+                * (
+                    sum(1 for kw in keywords if kw.lower() in (title + summary).lower())
+                    / max(len(keywords), 1)
+                )
                 + 0.3 * min(max((year - 2015) / 11, 0), 1),
-                2
+                2,
             )
 
             entry_id = entry.findtext("atom:id", "", ns) or ""
-            paper_id = entry_id.split("/")[-1] if entry_id else hashlib.md5(title.encode()).hexdigest()[:8]
+            paper_id = (
+                entry_id.split("/")[-1]
+                if entry_id
+                else hashlib.md5(title.encode()).hexdigest()[:8]
+            )
 
-            results.append({
-                "paper_id": paper_id,
-                "title": title,
-                "abstract": summary.strip()[:300],
-                "authors": authors[:5],
-                "year": year,
-                "venue": "arXiv",
-                "citations": 0,
-                "url": link,
-                "open_access_pdf": pdf,
-                "score": score,
-                "relevance_reason": (
-                    "arXiv预印本，标题匹配关键词"
-                    if any(kw.lower() in title.lower() for kw in keywords)
-                    else "arXiv预印本"
-                )
-            })
+            results.append(
+                {
+                    "paper_id": paper_id,
+                    "title": title,
+                    "abstract": summary.strip()[:300],
+                    "authors": authors[:5],
+                    "year": year,
+                    "venue": "arXiv",
+                    "citations": 0,
+                    "url": link,
+                    "open_access_pdf": pdf,
+                    "score": score,
+                    "relevance_reason": (
+                        "arXiv预印本，标题匹配关键词"
+                        if any(kw.lower() in title.lower() for kw in keywords)
+                        else "arXiv预印本"
+                    ),
+                }
+            )
     except ET.ParseError:
         return _empty_result(keywords, 0)
 
@@ -595,4 +926,9 @@ def _search_arxiv(keywords: list[str], limit: int) -> dict:
 
 
 def _empty_result(keywords: list[str], elapsed_ms: int) -> dict:
-    return {"keywords": keywords, "source_used": "none", "elapsed_ms": elapsed_ms, "results": []}
+    return {
+        "keywords": keywords,
+        "source_used": "none",
+        "elapsed_ms": elapsed_ms,
+        "results": [],
+    }

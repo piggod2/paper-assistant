@@ -20,23 +20,111 @@ except ImportError:
 
 # ── 操作关键词（规则路由，不需要 LLM）──
 
-DETECT_KW = ["检测", "看看", "有没有ai味", "有没有ai", "ai味", "ai痕迹", "机器味", "是不是ai", "像不像ai", "帮我看看", "查一下"]
-POLISH_KW = ["改", "润色", "去掉", "去除", "自然", "去ai", "去模板", "精简", "帮我改", "修一下", "优化", "别那么ai"]
-TRANSLATE_ZH2EN_KW = ["翻译成英文", "译成英文", "翻成英文", "英文翻译", "中译英", "translate"]
+DETECT_KW = [
+    "检测",
+    "看看",
+    "有没有ai味",
+    "有没有ai",
+    "ai味",
+    "ai痕迹",
+    "机器味",
+    "是不是ai",
+    "像不像ai",
+    "帮我看看",
+    "查一下",
+]
+POLISH_KW = [
+    "改",
+    "润色",
+    "去掉",
+    "去除",
+    "自然",
+    "去ai",
+    "去模板",
+    "精简",
+    "帮我改",
+    "修一下",
+    "优化",
+    "别那么ai",
+]
+TRANSLATE_ZH2EN_KW = [
+    "翻译成英文",
+    "译成英文",
+    "翻成英文",
+    "英文翻译",
+    "中译英",
+    "translate",
+]
 TRANSLATE_EN2ZH_KW = ["翻译成中文", "译成中文", "翻成中文", "中文翻译", "英译中"]
-SEARCH_KW = ["找文献", "找论文", "找相关", "相关文献", "相关论文", "搜论文", "搜文献", "推荐文献", "推荐论文", "reference", "paper", "检索文献", "检索论文", "找一下", "搜一下"]
-PIPELINE_KW = ["全流程", "一条龙", "全部", "都处理", "都跑", "一键", "全部处理", "完整处理", "都做"]
+SEARCH_KW = [
+    "找文献",
+    "找论文",
+    "找相关",
+    "相关文献",
+    "相关论文",
+    "搜论文",
+    "搜文献",
+    "推荐文献",
+    "推荐论文",
+    "reference",
+    "paper",
+    "检索文献",
+    "检索论文",
+    "找一下",
+    "搜一下",
+]
+# 词表是精确子串匹配，「帮我找几篇关于…的论文」这类插入了量词/主题的句式匹配不到，
+# 所以补一条宽松正则兜底
+SEARCH_RE = re.compile(
+    r"(?:找|搜|检索|推荐)[^。！？\n]{0,15}?(?:论文|文献|paper|reference)"
+)
+PIPELINE_KW = [
+    "全流程",
+    "一条龙",
+    "全部",
+    "都处理",
+    "都跑",
+    "一键",
+    "全部处理",
+    "完整处理",
+    "都做",
+]
 EXPLAIN_KW = ["为什么", "解释", "凭什么", "依据", "证据", "原理"]
 
 
-def chat(message: str, history: list | None = None) -> dict:
+def chat(message: str, history: list | None = None, mode: str = "auto") -> dict:
     """
     单轮 Agent 入口。
     返回 { reply, tool_calls, results, context_updated }
+
+    mode 参数允许前端显式指定意图，绕开关键词猜测：
+      auto    → 自动识别（默认，保留原逻辑）
+      chat    → 强制自由问答（直接 fallback 交给 LLM，不做工具路由）
+      polish  → 强制润色
+      detect  → 强制检测
     """
     msg = (message or "").strip()
     if not msg:
-        return _reply("请把要处理的论文段落贴给我，或者说一句指令，例如「帮我看看有没有 AI 味」。", [], {})
+        return _reply(
+            "请把要处理的论文段落贴给我，或者说一句指令，例如「帮我看看有没有 AI 味」。",
+            [],
+            {},
+        )
+
+    # 显式模式优先：用户主动选了意图，不再做关键词猜测
+    mode = (mode or "auto").strip().lower()
+    if mode == "chat":
+        # 强制自由问答：直接交给 LLM，不管文本里有没有「润色/检测」字样
+        return {
+            "reply": "已切换 AI 问答。",
+            "tool_calls": [],
+            "results": {},
+            "fallback": True,
+        }
+    if mode == "polish":
+        return _run_polish(msg)
+    if mode == "detect":
+        return _run_detect(msg)
 
     # ── 第一步：判断这是"贴了新文本"还是"对文本做操作" ──
     # 规则：无操作关键词、且长度较长 → 视为贴了文本
@@ -67,7 +155,7 @@ def chat(message: str, history: list | None = None) -> dict:
         return _run_translate(msg, "en", "zh")
 
     # 检索
-    if _match_any(msg, SEARCH_KW) and not is_text_input:
+    if _match_search(msg) and not is_text_input:
         return _run_search(msg)
 
     # 全流程（放最后，避免"全部/都"误伤其他指令）
@@ -90,15 +178,27 @@ def chat(message: str, history: list | None = None) -> dict:
 
 # ── 意图判断辅助 ──
 
+
 def _has_action(msg: str) -> bool:
-    all_kw = (DETECT_KW + POLISH_KW + TRANSLATE_ZH2EN_KW + TRANSLATE_EN2ZH_KW
-              + SEARCH_KW + PIPELINE_KW + EXPLAIN_KW)
-    return _match_any(msg, all_kw)
+    all_kw = (
+        DETECT_KW
+        + POLISH_KW
+        + TRANSLATE_ZH2EN_KW
+        + TRANSLATE_EN2ZH_KW
+        + PIPELINE_KW
+        + EXPLAIN_KW
+    )
+    return _match_any(msg, all_kw) or _match_search(msg)
 
 
 def _match_any(msg: str, keywords: list[str]) -> bool:
     low = msg.lower()
     return any(kw in low for kw in keywords)
+
+
+def _match_search(msg: str) -> bool:
+    """检索意图：词表精确匹配 + 正则兜底（兼容「帮我找几篇关于X的论文」）。"""
+    return _match_any(msg, SEARCH_KW) or bool(SEARCH_RE.search(msg.lower()))
 
 
 def _extract_body(msg: str) -> str:
@@ -123,7 +223,14 @@ def _extract_body(msg: str) -> str:
 
     # 2. 兜底：若剥离后仍过短，取操作词之前的文本
     if len(body) < 5:
-        for kw in (PIPELINE_KW + TRANSLATE_ZH2EN_KW + TRANSLATE_EN2ZH_KW + POLISH_KW + DETECT_KW + SEARCH_KW):
+        for kw in (
+            PIPELINE_KW
+            + TRANSLATE_ZH2EN_KW
+            + TRANSLATE_EN2ZH_KW
+            + POLISH_KW
+            + DETECT_KW
+            + SEARCH_KW
+        ):
             idx = msg.lower().find(kw)
             if idx > 0:
                 candidate = msg[:idx].strip("「」《》\"'‘’“” \n：:，,。")
@@ -134,10 +241,15 @@ def _extract_body(msg: str) -> str:
 
 # ── 各工具执行 ──
 
+
 def _run_detect(msg: str) -> dict:
     text = _extract_body(msg)
     if len(text) < 5:
-        return _reply("要检测的文本太短了，把论文段落贴给我，再说「帮我看看有没有 AI 味」。", ["detect"], {})
+        return _reply(
+            "要检测的文本太短了，把论文段落贴给我，再说「帮我看看有没有 AI 味」。",
+            ["detect"],
+            {},
+        )
     report = detector.detect(text)
     return _format_detect_reply(text, report)
 
@@ -162,7 +274,12 @@ def _format_detect_reply(text: str, report: dict) -> dict:
 
     # 分级摘要
     grade_lines = []
-    for grade, label in [("A", "机械改"), ("B", "建议改"), ("F", "指纹"), ("C", "只报告")]:
+    for grade, label in [
+        ("A", "机械改"),
+        ("B", "建议改"),
+        ("F", "指纹"),
+        ("C", "只报告"),
+    ]:
         cnt = sum(len(v) for k, v in hits.items() if k.startswith(grade))
         if cnt:
             grade_lines.append(f"· {grade}级（{label}）×{cnt}")
@@ -189,7 +306,11 @@ def _format_detect_reply(text: str, report: dict) -> dict:
 def _run_polish(msg: str) -> dict:
     text = _extract_body(msg)
     if len(text) < 5:
-        return _reply("要润色的文本太短了，把论文段落贴给我，再说「帮我改」或「帮我润色」。", ["polish"], {})
+        return _reply(
+            "要润色的文本太短了，把论文段落贴给我，再说「帮我改」或「帮我润色」。",
+            ["polish"],
+            {},
+        )
     report = detector.detect(text)
     result = rewriter.rewrite(text, report)
     return _format_polish_reply(result, report)
@@ -219,9 +340,7 @@ def _format_polish_reply(result: dict, report: dict) -> dict:
     x_hits = {k: v for k, v in report.get("hits", {}).items() if k.startswith("X")}
     if x_hits:
         x_cnt = sum(len(v) for v in x_hits.values())
-        parts.append(
-            f"\n【故意没改 · {x_cnt} 处】"
-        )
+        parts.append(f"\n【故意没改 · {x_cnt} 处】")
         parts.append("配对复测显示这些特征人类用得比 AI 还多，改了反而假：")
         for k, vs in list(x_hits.items())[:3]:
             if vs:
@@ -238,19 +357,27 @@ def _format_polish_reply(result: dict, report: dict) -> dict:
 
     parts.append("\n\n想逐条看每处为什么这么改吗？说「为什么改这里」。")
 
-    return _reply("\n".join(parts), ["detect", "polish"], {
-        "polished": polished,
-        "changes": changes,
-        "report": report
-    })
+    return _reply(
+        "\n".join(parts),
+        ["detect", "polish"],
+        {"polished": polished, "changes": changes, "report": report},
+    )
 
 
 def _run_translate(msg: str, from_lang: str, to_lang: str) -> dict:
     text = _extract_body(msg)
     if len(text) < 3:
-        return _reply("要翻译的内容太短了，把英文/中文文本贴给我，再说「翻译成中文/英文」。", ["translate"], {})
+        return _reply(
+            "要翻译的内容太短了，把英文/中文文本贴给我，再说「翻译成中文/英文」。",
+            ["translate"],
+            {},
+        )
     if not translator.is_available():
-        return _reply("翻译功能未配置（缺少百度翻译密钥），但检测和润色完全可用。", ["translate"], {"unavailable": True})
+        return _reply(
+            "翻译功能未配置（缺少百度翻译密钥），但检测和润色完全可用。",
+            ["translate"],
+            {"unavailable": True},
+        )
     r = translator.translate(text, from_lang, to_lang)
     if "error" in r:
         return _reply(f"翻译失败：{r.get('detail', '未知错误')}", ["translate"], {})
@@ -258,13 +385,24 @@ def _run_translate(msg: str, from_lang: str, to_lang: str) -> dict:
     parts = [
         f"🌐 翻译完成（{direction}，{r.get('segments', 1)} 段）：",
         "",
-        r.get("translated", "")
+        r.get("translated", ""),
     ]
-    return _reply("\n".join(parts), ["translate"], {"translated": r.get("translated", "")})
+    return _reply(
+        "\n".join(parts), ["translate"], {"translated": r.get("translated", "")}
+    )
 
 
 def _run_search(msg: str) -> dict:
-    text = _extract_body(msg)
+    body = _extract_body(msg)
+    # 剥掉指令壳，只留检索主题（「帮我找几篇关于X的论文」→「X」）
+    topic = re.sub(
+        r"(帮我|请|麻烦|给我)?(找|搜索|搜|检索|推荐)(一下|几篇|一些|一点|点)?(关于|有关)?",
+        "",
+        body,
+    )
+    topic = re.sub(r"(的)?(相关)?(论文|文献)$", "", topic).strip(" ，。：:")
+    # 剥完没剩主题（如只说「帮我找论文」）→ 引导用户给主题，而不是拿指令词去搜
+    text = topic
     if len(text) < 3:
         return _reply("请把论文摘要或主题贴给我，再说「找相关文献」。", ["search"], {})
     r = searcher.search(text, limit=5)
@@ -272,63 +410,112 @@ def _run_search(msg: str) -> dict:
     source = r.get("source_used", "none")
 
     if not papers:
-        return _reply("没检索到相关文献，建议换更具体的关键词试试。", ["search"], {"results": []})
+        return _reply(
+            "没检索到相关文献，建议换更具体的关键词试试。", ["search"], {"results": []}
+        )
 
     parts = [f"📄 找到 {len(papers)} 篇相关文献（来源：{source}）：", ""]
     for i, p in enumerate(papers[:5], 1):
         parts.append(f"{i}. {p.get('title', '')}")
-        parts.append(f"   {p.get('authors', [])[:2]} · {p.get('year', '?')}年 · 相关度 {p.get('score', 0)}")
-        if p.get('relevance_reason'):
+        parts.append(
+            f"   {p.get('authors', [])[:2]} · {p.get('year', '?')}年 · 相关度 {p.get('score', 0)}"
+        )
+        if p.get("relevance_reason"):
             parts.append(f"   理由：{p.get('relevance_reason')}")
-        if p.get('url'):
+        if p.get("url"):
             parts.append(f"   {p.get('url')}")
         parts.append("")
 
-    parts.append("（说明：当前使用 arXiv 免费源，Semantic Scholar 的 key 获批后将支持更精准的语义推荐）")
+    parts.append(
+        "（说明：当前使用 arXiv 免费源，Semantic Scholar 的 key 获批后将支持更精准的语义推荐）"
+    )
     return _reply("\n".join(parts), ["search"], {"results": papers})
 
 
 def _run_pipeline(msg: str) -> dict:
     text = _extract_body(msg)
     if len(text) < 5:
-        return _reply("要处理的内容太短了，把论文段落贴给我，再说「帮我全流程处理」。", ["pipeline"], {})
+        return _reply(
+            "要处理的内容太短了，把论文段落贴给我，再说「帮我全流程处理」。",
+            ["pipeline"],
+            {},
+        )
 
     steps = []
     # 1 检测
     t0 = time.perf_counter()
     report = detector.detect(text)
-    steps.append({"step": "detect", "status": "ok", "elapsed_ms": int((time.perf_counter()-t0)*1000),
-                  "message": f"检测 {report.get('actionable_total', 0)} 处特征"})
+    steps.append(
+        {
+            "step": "detect",
+            "status": "ok",
+            "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            "message": f"检测 {report.get('actionable_total', 0)} 处特征",
+        }
+    )
 
     # 2 润色（核心）
     t0 = time.perf_counter()
     result = rewriter.rewrite(text, report)
-    steps.append({"step": "polish", "status": "ok", "elapsed_ms": int((time.perf_counter()-t0)*1000),
-                  "message": f"改写 {result.get('total_changes', 0)} 处"})
+    steps.append(
+        {
+            "step": "polish",
+            "status": "ok",
+            "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            "message": f"改写 {result.get('total_changes', 0)} 处",
+        }
+    )
 
     # 3 检索（可选，失败不中断）
     t0 = time.perf_counter()
     sr = searcher.search(text[:300], 3)
     papers = sr.get("results", [])
-    steps.append({"step": "search", "status": "ok" if papers else "empty",
-                  "elapsed_ms": int((time.perf_counter()-t0)*1000),
-                  "message": f"{sr.get('source_used', 'none')}：{len(papers)} 篇"})
+    steps.append(
+        {
+            "step": "search",
+            "status": "ok" if papers else "empty",
+            "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            "message": f"{sr.get('source_used', 'none')}：{len(papers)} 篇",
+        }
+    )
 
     # 4 翻译（可选，失败不中断）
     if translator.is_available():
         t0 = time.perf_counter()
         tr = translator.translate(text, "zh", "en")
         if "error" not in tr:
-            steps.append({"step": "translate", "status": "ok", "elapsed_ms": int((time.perf_counter()-t0)*1000),
-                          "message": "已生成英文稿"})
+            steps.append(
+                {
+                    "step": "translate",
+                    "status": "ok",
+                    "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                    "message": "已生成英文稿",
+                }
+            )
         else:
-            steps.append({"step": "translate", "status": "skipped", "elapsed_ms": 0, "message": "翻译失败，跳过"})
+            steps.append(
+                {
+                    "step": "translate",
+                    "status": "skipped",
+                    "elapsed_ms": 0,
+                    "message": "翻译失败，跳过",
+                }
+            )
     else:
-        steps.append({"step": "translate", "status": "skipped", "elapsed_ms": 0, "message": "未配置，跳过"})
+        steps.append(
+            {
+                "step": "translate",
+                "status": "skipped",
+                "elapsed_ms": 0,
+                "message": "未配置，跳过",
+            }
+        )
 
     parts = ["📄 全流程完成，各步骤：", ""]
     for s in steps:
-        icon = "✅" if s["status"] == "ok" else ("⚠️" if s["status"] == "skipped" else "—")
+        icon = (
+            "✅" if s["status"] == "ok" else ("⚠️" if s["status"] == "skipped" else "—")
+        )
         parts.append(f"{icon} {s['step']}：{s['message']}（{s['elapsed_ms']}ms）")
 
     parts.append("\n——润色结果——")
@@ -339,11 +526,11 @@ def _run_pipeline(msg: str) -> dict:
         for p in papers[:3]:
             parts.append(f"· {p.get('title', '')}（{p.get('year', '?')}）")
 
-    return _reply("\n".join(parts), ["detect", "polish", "search", "translate"], {
-        "polished": result.get("polished", ""),
-        "papers": papers,
-        "steps": steps
-    })
+    return _reply(
+        "\n".join(parts),
+        ["detect", "polish", "search", "translate"],
+        {"polished": result.get("polished", ""), "papers": papers, "steps": steps},
+    )
 
 
 def _reply_explain() -> dict:
@@ -352,7 +539,8 @@ def _reply_explain() -> dict:
         "比如「不是…而是…」翻案腔，配对复测显示 GPT δ+0.88 / Opus δ+0.72，是证据最强的纯写作信号，所以我改。\n\n"
         "而「首先」「这意味着」「赋能」这些，配对复测后方向反转（人类反而更常用），所以我【故意不改】。\n\n"
         "完整规则和证据在左侧「检测级别」面板或 /api/rules 里都能看到。",
-        ["explain"], {}
+        ["explain"],
+        {},
     )
 
 

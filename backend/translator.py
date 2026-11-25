@@ -26,17 +26,25 @@ def _sign(q: str, salt: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-def translate(text: str, from_lang: str = "en", to_lang: str = "zh") -> dict:
+def translate(text: str, from_lang: str = "auto", to_lang: str = "zh") -> dict:
     """
     Translate text via Baidu Translate API.
     Returns {translated, segments, elapsed_ms, source_lang, target_lang}
     or {error, detail} on failure.
+
+    from_lang="auto" 时自动检测方向：含中文 → zh→en，否则 en→zh。
     """
     if not is_available():
         return {"error": "翻译未配置", "detail": "请在 .env 设置 BAIDU_APPID / BAIDU_SECRET"}
 
     if not text.strip():
         return {"translated": "", "segments": 0, "elapsed_ms": 0, "source_lang": from_lang, "target_lang": to_lang}
+
+    # 自动判断方向（默认中英互译）
+    if from_lang == "auto":
+        has_zh = bool(re.search(r"[一-鿿]", text))
+        from_lang = "zh" if has_zh else "en"
+        to_lang = "en" if has_zh else "zh"
 
     plan = os.getenv("BAIDU_PLAN", "advanced")
     max_chars = 6000 if plan == "advanced" else 1000
